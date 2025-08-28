@@ -1,0 +1,10 @@
+PyQt6
+google-generativeai
+Pillow
+PyMuPDF
+packaging
+opencv-python
+psutil
+pywinauto
+pyautogui
+pywin32
