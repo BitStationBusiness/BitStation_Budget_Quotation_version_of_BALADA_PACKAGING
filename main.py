@@ -669,7 +669,6 @@ class TgpAutomationWorker(QThread):
         self._click_xy(758, 685)
         self._wait_or_abort(0.5)
 
-
     # ---------- Orquestación principal ----------
     def run(self):
         try:
@@ -1346,41 +1345,87 @@ class OptionAPage(QWidget):
 class EmailGenWorker(QThread):
     finished = pyqtSignal(str, str)
     failed = pyqtSignal(str)
-    def __init__(self, api_key: str, recipient_name: str, img_bytes: bytes, mime: str):
+
+    def __init__(self, api_key: str, recipient_name: str, img_bytes: bytes, mime: str, sender_identity: str = ""):
         super().__init__()
         self.api_key = api_key
-        self.recipient_name = recipient_name.strip()
+        self.recipient_name = (recipient_name or "").strip()
         self.img_bytes = img_bytes
         self.mime = mime or "image/png"
+        self.sender_identity = (sender_identity or "").strip()
+
     def run(self):
         try:
             genai.configure(api_key=self.api_key)
             model = genai.GenerativeModel("gemini-1.5-flash-latest")
+
             schema = {
                 "type": "OBJECT",
                 "properties": {"subject": {"type": "STRING"}, "body": {"type": "STRING"}},
                 "required": ["subject", "body"]
             }
-            cfg = GenerationConfig(response_mime_type="application/json", response_schema=schema, temperature=0.2)
+            cfg = GenerationConfig(
+                response_mime_type="application/json",
+                response_schema=schema,
+                temperature=0.2
+            )
+
+            # Prompt con identidad del remitente (contexto), pero redacción IMPERSONAL
             prompt = (
-                "Lee el texto manuscrito/imprimido de la imagen y genera un correo de solicitud de cotización.\n"
+                "Lee el texto manuscrito/impreso de la imagen y genera un correo profesional de solicitud de cotización.\n"
                 f"- Destinatario: {self.recipient_name or '[Nombre del destinatario]'}\n"
-                "- Usa una tabla estilo Markdown con tuberías para listar ítems (| Ítem | Cantidad | Detalle |).\n"
-                "- Devuelve un asunto breve y un cuerpo formal, en español.\n"
+                f"- Remitente (para contexto de tono y firma): {self.sender_identity or '[Nombre/Empresa]'}\n"
+                "- Redacción impersonal: NO escribas el nombre del remitente/empresa dentro del CUERPO. "
+                "Evita frases como “Acme S.A. solicita…”. Usa formulaciones neutras, por ejemplo: "
+                "“Por medio de la presente, solicitamos…”.\n"
+                "- Incluye una tabla estilo Markdown con tuberías para listar ítems (| Ítem | Cantidad | Detalle |).\n"
+                "- Cierra con un saludo de cortesía y, EN LA SIGUIENTE LÍNEA, escribe exactamente el placeholder "
+                "[Nombre/Empresa] para que el programa lo sustituya por la firma real.\n"
+                "- Devuelve un asunto breve y un cuerpo formal en español.\n"
                 "- No inventes datos; si faltan, deja texto genérico.\n"
                 "Devuelve SOLO JSON con 'subject' y 'body'."
             )
+
             part = {"mime_type": self.mime, "data": self.img_bytes}
             resp = model.generate_content([prompt, part], generation_config=cfg)
             raw = getattr(resp, "text", "") or "{}"
             data = safe_json_loads(raw)
+
             subject = (data.get("subject") or "").strip() or "Solicitud de cotización"
             body = (data.get("body") or "").strip()
+
+            # --- Post-procesado anti-redundancia ---
+            # 1) "Por medio/Mediante la presente, <alguien> solicita..." -> "... solicitamos ..."
+            body = re.sub(
+                r"(?i)(\bpor\s+medio\s+de\s+la\s+presente,\s*)[^.,\n]+?(\s+solicita(?:n)?)",
+                r"\1solicitamos",
+                body,
+                count=1,
+            )
+            body = re.sub(
+                r"(?i)(\bmediante\s+la\s+presente,\s*)[^.,\n]+?(\s+solicita(?:n)?)",
+                r"\1solicitamos",
+                body,
+                count=1,
+            )
+            # 2) Si conocemos el remitente, por si aparece en otra frase: "<Remitente> solicita..." -> "solicitamos..."
+            if self.sender_identity:
+                safe_sender = re.escape(self.sender_identity)
+                body = re.sub(
+                    rf"(?i)\b{safe_sender}\b\s+solicita(?:n)?",
+                    "solicitamos",
+                    body,
+                )
+
+            # Reemplazo del destinatario si quedó como placeholder
             if self.recipient_name:
-                body = body.replace("[Nombre del destinatario]", self.recipient_name).replace("[Destinatario]", self.recipient_name)
+                body = body.replace("[Nombre del destinatario]", self.recipient_name)\
+                           .replace("[Destinatario]", self.recipient_name)
+
             self.finished.emit(subject, body)
         except Exception as e:
             self.failed.emit(human_ex(e))
+
 
 # ------------------- Opción B (Presupuestos) ---------
 
@@ -1402,6 +1447,63 @@ class OptionBPage(QWidget):
         self._body_raw: str = ""
 
         self._build_ui()
+
+    # --- Reemplazo de placeholders por identidad (mejorado) ---
+    def _replace_owner_placeholders(self, text: str, owner: str) -> str:
+        """
+        Reemplaza, de forma insensible a mayúsculas/minúsculas, todas las variantes
+        habituales de placeholders por el nombre/empresa configurado.
+        """
+        if not owner or not text:
+            return text
+        placeholders = (
+            r"\[Tu\s+Nombre\]",
+            r"\[Tu\s+nombre\]",
+            r"\[Tu\s+Nombre/Empresa\]",
+            r"\[Nombre/Empresa\]",
+            r"\[Nombre\s+de\s+Empresa\]",
+            r"\[Nombre\s+de\s+empresa\]",
+            r"\[nombre\s+de\s+empresa\]",
+            r"\[Empresa\]",
+            r"\[empresa\]",
+            r"\[Mi\s+Empresa\]",
+            r"\[mi\s+empresa\]",
+            r"\[Su\s+Nombre/Empresa\]",
+            r"\[Su\s+Nombre\]",
+            r"\[Su\s+Empresa\]",
+            r"\[Firma\]",
+            r"\[Firma/Empresa\]",
+            r"\[Nombre\s*o\s*Empresa\]",
+            r"\[Nombre\s*o\s*empresa\]",
+        )
+        for pat in placeholders:
+            text = re.sub(pat, owner, text, flags=re.IGNORECASE)
+        return text
+
+    def _apply_owner_name(self, text: str) -> str:
+        """Aplica el nombre/empresa guardado en Configuración a cualquier texto."""
+        owner = self.main.settings.value("accounts/owner_name", "", str).strip()
+        return self._replace_owner_placeholders(text, owner)
+
+    def update_owner_name(self, owner: str):
+        """
+        Se llama cuando cambias la Identidad en Configuración.
+        Actualiza el cuerpo ya generado (si existe) para reflejar el nuevo valor.
+        """
+        owner = (owner or "").strip()
+        if not owner:
+            return
+        if self._body_raw:
+            new_raw = self._replace_owner_placeholders(self._body_raw, owner)
+            if new_raw != self._body_raw:
+                self._body_raw = new_raw
+                self._render_body_from_raw()
+        else:
+            current = self.body_edit.toPlainText()
+            new = self._replace_owner_placeholders(current, owner)
+            if new != current:
+                self._body_raw = new
+                self._render_body_from_raw()
 
     def _compose_html_document(self, subj: str, body_text: str) -> str:
         body_html = self._body_text_to_html(body_text)
@@ -1741,10 +1843,13 @@ class OptionBPage(QWidget):
         if not api_key:
             return
 
+        # Si sólo cambió el nombre del destinatario y ya hay texto, ajusta placeholders localmente
         if trigger.startswith("name") and (self._body_raw or self.body_edit.toPlainText().strip()):
             name_now = self.to_edit.text().strip()
             if name_now:
-                self._body_raw = (self._body_raw or self.body_edit.toPlainText()).replace("[Nombre del destinatario]", name_now)
+                self._body_raw = (self._body_raw or self.body_edit.toPlainText()) \
+                    .replace("[Nombre del destinatario]", name_now) \
+                    .replace("[Destinatario]", name_now)
                 self._render_body_from_raw()
                 return
 
@@ -1754,56 +1859,22 @@ class OptionBPage(QWidget):
             return
 
         name_now = self.to_edit.text().strip()
+
+        # Identidad del remitente desde Configuración (no se repite en el cuerpo; la IA usará redacción impersonal)
+        sender_identity = self.main.settings.value("accounts/owner_name", "", str).strip()
+
         self.subject_edit.setPlaceholderText("Generando asunto con IA…")
         self.body_edit.setPlaceholderText("Generando cuerpo con IA…")
         self.btn_pdf.setEnabled(False); self.btn_send.setEnabled(False); self.btn_print.setEnabled(False)
 
-        self._ai_worker = EmailGenWorker(api_key, name_now, img, mime)
+        # ⬇⬇ Corregido: ahora pasamos sender_identity
+        self._ai_worker = EmailGenWorker(api_key, name_now, img, mime, sender_identity)
         self._ai_worker.finished.connect(self._on_ai_ready)
         self._ai_worker.failed.connect(self._on_ai_failed)
         self._ai_worker.start()
         print("[IA-Presupuestos] Worker iniciado.")
 
-    def _apply_owner_name(self, text: str) -> str:
-        owner = self.main.settings.value("accounts/owner_name", "", str).strip()
-        if not owner:
-            return text
-        placeholders = (
-            "[Tu Nombre]", "[Tu nombre]", "[Tu Nombre/Empresa]", "[Nombre/Empresa]",
-            "[Nombre de Empresa]", "[Nombre de empresa]", "[nombre de empresa]",
-            "[Empresa]", "[empresa]", "[Mi Empresa]", "[mi empresa]"
-        )
-        for ph in placeholders:
-            text = text.replace(ph, owner)
-        return text
 
-    def update_owner_name(self, owner: str):
-        owner = (owner or "").strip()
-        if not owner:
-            return
-        placeholders = (
-            "[Tu Nombre]", "[Tu nombre]", "[Tu Nombre/Empresa]", "[Nombre/Empresa]",
-            "[Nombre de Empresa]", "[Nombre de empresa]", "[nombre de empresa]",
-            "[Empresa]", "[empresa]", "[Mi Empresa]", "[mi empresa]"
-        )
-        changed = False
-        if self._body_raw:
-            new_raw = self._body_raw
-            for ph in placeholders:
-                new_raw = new_raw.replace(ph, owner)
-            if new_raw != self._body_raw:
-                self._body_raw = new_raw
-                changed = True
-        else:
-            current = self.body_edit.toPlainText()
-            new = current
-            for ph in placeholders:
-                new = new.replace(ph, owner)
-            if new != current:
-                self._body_raw = new
-                changed = True
-        if changed:
-            self._render_body_from_raw()
 
     def _render_body_from_raw(self):
         raw = (self._body_raw or "").strip()
