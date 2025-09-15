@@ -8,3 +8,8 @@ psutil
 pywinauto
 pyautogui
 pywin32
+pynput
+requests
+WeasyPrint
+
+python-telegram-bot==21.*

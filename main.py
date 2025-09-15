@@ -1,13 +1,13 @@
-# neeeew.py  — BALADA PACKAGING · Presupuestos (Python 3.10, Windows, PyQt6)
-# ---------------------------------------------------------------------------------
-# Cambios:
-# - Tablas HTML en correo / preview / PDF.
-# - Firma con Nombre/Empresa desde Configuración.
-# - Panel de sistema (CPU/RAM/GPU/CUDA) formateado.
-# - Botón de actualizar grande.
-# - Campos de rutas (TGP y PDF) con "Elegir carpeta de destino".
-# - Logs detallados y correcciones previas mantenidas.
-# ---------------------------------------------------------------------------------
+# BALADA PACKAGING · Presupuestos — versión con TGP integrado (auto-run)
+# Python 3.10 / Windows / PyQt6
+# - Cámara en Facturas (Option A) con rotación y auto-crop
+# - Cámara en Presupuestos (Option B) con rotación y auto-crop
+# - Tabla Markdown → HTML con estilos inline (vista previa, Gmail y PDF)
+# - PDF A4 con márgenes y tipografía legible
+# - Impresión como imagen (PDF→QImage 300 ppp)
+# - Automatización TGP integrada (desde Option A > Procesar) **CON ventana de confirmación previa**
+# - Parada de emergencia GLOBAL **solo con tecla ESC**
+# ---------------------------------------------------------------------
 
 import os
 import re
@@ -18,21 +18,25 @@ import smtplib
 import shutil
 import platform
 import subprocess
+import tempfile
+import threading
 from typing import List, Dict, Any, Optional, Tuple
 
 # Qt
 from PyQt6.QtCore import (
-    Qt, QSize, QTimer, QThread, pyqtSignal, QSettings, QMarginsF
+    Qt, QSize, QTimer, QThread, pyqtSignal, QSettings, QMarginsF, QEvent
 )
 from PyQt6.QtGui import (
-    QIcon, QPixmap, QImage, QFont, QTextDocument
+    QIcon, QPixmap, QImage, QFont, QTextDocument, QPageLayout, QPageSize, QPainter
 )
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QVBoxLayout, QHBoxLayout,
     QPushButton, QFileDialog, QStackedWidget, QLineEdit, QTextEdit,
-    QComboBox, QMessageBox, QGroupBox, QFormLayout, QTabWidget, QDialog
+    QComboBox, QMessageBox, QGroupBox, QFormLayout, QTabWidget, QDialog,
+    QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView, QStyledItemDelegate,
+    QTextBrowser
 )
-from PyQt6.QtPrintSupport import QPrinter
+from PyQt6.QtPrintSupport import QPrinter, QPrintDialog, QPrinterInfo
 
 # IA y PDF
 import fitz  # PyMuPDF
@@ -45,11 +49,18 @@ import requests
 # Cámara
 import cv2
 
-# Opcional para info del sistema (RAM, GPU)
+# Sistema
 try:
     import psutil
-except Exception:
+except ImportError:
     psutil = None
+
+# Entrada global
+try:
+    from pynput import keyboard, mouse
+except ImportError:
+    keyboard = None
+    mouse = None
 
 # ------------------- Utilidades básicas -------------------
 
@@ -78,6 +89,98 @@ def resource_path(*parts) -> str:
 
 def human_ex(err: Exception) -> str:
     return f"{type(err).__name__}: {err}"
+
+# ---- HTML helpers ----
+def html_escape(s: str) -> str:
+    return (
+        str(s)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+def markdown_table_to_html(text: str) -> Optional[str]:
+    """Convierte todo el cuerpo en HTML (párrafos + tablas Markdown)."""
+    lines = text.splitlines()
+    i = 0  # [FIX] corregido (antes había un '>' accidental que causaba SyntaxError)
+    out_parts: List[str] = []
+    found_table = False
+
+    def emit_paragraphs(chunk: List[str]):
+        for ln in chunk:
+            if not ln.strip():
+                out_parts.append("<p style='margin:0 0 12px'>&nbsp;</p>")
+            else:
+                out_parts.append(f"<p style='margin:0 0 10px'>{html_escape(ln)}</p>")
+
+    while i < len(lines):
+        if lines[i].strip().startswith("|"):
+            block = []
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                block.append(lines[i].strip())
+                i += 1
+
+            cleaned = []
+            for raw in block:
+                parts = [c.strip() for c in raw.split("|")]
+                if parts and parts[0] == "":
+                    parts = parts[1:]
+                if parts and parts[-1] == "":
+                    parts = parts[:-1]
+                if parts and set("".join(parts)) <= set("-: "):
+                    continue
+                if parts:
+                    cleaned.append(parts)
+
+            if cleaned:
+                found_table = True
+                thead_cells = "".join(
+                    f"<th style='background:#f6f8fa;border:1px solid #dfe3e8;"
+                    f"padding:8px 10px;text-align:left;font-weight:600'>{html_escape(c)}</th>"
+                    for c in cleaned[0]
+                )
+                body_rows = []
+                for row in cleaned[1:]:
+                    tds = "".join(
+                        f"<td style='border:1px solid #e6e9ef;padding:8px 10px;vertical-align:top'>{html_escape(c)}</td>"
+                        for c in row
+                    )
+                    body_rows.append(f"<tr style='page-break-inside:avoid'>{tds}</tr>")
+
+                table_html = (
+                    "<table style='border-collapse:collapse;width:100%;table-layout:fixed;margin:8px 0 12px;"
+                    "font-family:Arial;font-size:12pt;color:#222'>"
+                    f"<thead><tr>{thead_cells}</tr></thead>"
+                    f"<tbody>{''.join(body_rows)}</tbody></table>"
+                )
+                out_parts.append(table_html)
+            else:
+                emit_paragraphs(block)
+        else:
+            non = []
+            while i < len(lines) and not lines[i].strip().startswith("|"):
+                non.append(lines[i])
+                i += 1
+            emit_paragraphs(non)
+
+    html = "".join(out_parts).strip()
+    return html if found_table else None
+
+# ------------------- PDF → QImages (raster a 300 ppp) -------------------
+
+def render_pdf_to_qimages(pdf_path: str, dpi: int = 300) -> List[QImage]:
+    doc = fitz.open(pdf_path)
+    images: List[QImage] = []
+    try:
+        for page in doc:
+            pix = page.get_pixmap(dpi=dpi, alpha=False)
+            img = QImage(
+                pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888
+            )
+            images.append(img.copy())
+    finally:
+        doc.close()
+    return images
 
 # ------------------- Update / Version ---------------------
 
@@ -120,7 +223,6 @@ class DropImage(QLabel):
         self.mime: Optional[str] = None
         self.loaded_path: Optional[str] = None
 
-    # Placeholder helpers
     def _placeholder(self):
         self.setPixmap(QPixmap())
         self.setText("Arrastra una imagen/PDF aquí")
@@ -132,7 +234,11 @@ class DropImage(QLabel):
         self.loaded_path = None
         self._placeholder()
 
-    # DnD
+    def show_qimage(self, qimg: QImage):
+        self._pix = QPixmap.fromImage(qimg)
+        self.setText("")
+        self._rescale()
+
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls():
             e.acceptProposedAction()
@@ -185,6 +291,80 @@ class DropImage(QLabel):
             self._placeholder()
             print("[DropImage] Error:", human_ex(e))
 
+class EnterKeyDelegate(QStyledItemDelegate):
+    """Intercepta Enter/Return en editores de celdas y delega en la tabla."""
+    def createEditor(self, parent, option, index):
+        editor = super().createEditor(parent, option, index)
+        try:
+            editor.installEventFilter(self)
+        except Exception:
+            pass
+        return editor
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.KeyPress:
+            try:
+                key = event.key()
+            except Exception:
+                key = None
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                table = self.parent()
+                if hasattr(table, "handle_enter_action"):
+                    table.handle_enter_action()
+                    return True
+        return super().eventFilter(obj, event)
+
+class EditableTable(QTableWidget):
+    """Enter:
+       - Si la fila actual está vacía ⇒ se elimina.
+       - Si tiene contenido ⇒ inserta una fila debajo y entra en edición.
+       Al cambiar de fila: si la anterior queda vacía ⇒ se elimina."""
+    def __init__(self, rows: int, cols: int, parent=None):
+        super().__init__(rows, cols, parent)
+        self._cols = cols
+
+    def row_all_blank(self, r: int) -> bool:
+        if r < 0 or r >= self.rowCount():
+            return False
+        for c in range(self._cols):
+            it = self.item(r, c)
+            if it and it.text().strip():
+                return False
+        return True
+
+    def ensure_items(self, r: int):
+        for c in range(self._cols):
+            if not self.item(r, c):
+                self.setItem(r, c, QTableWidgetItem(""))
+
+    def handle_enter_action(self):
+        r = self.currentRow()
+        if r < 0:
+            insert_at = self.rowCount()
+            self.insertRow(insert_at)
+            self.ensure_items(insert_at)
+            self.setCurrentCell(insert_at, 0)
+            self.editItem(self.item(insert_at, 0))
+            return
+
+        if self.row_all_blank(r):
+            self.removeRow(r)
+            if self.rowCount() > 0:
+                self.setCurrentCell(min(r, self.rowCount() - 1), 0)
+            return
+
+        insert_at = r + 1
+        self.insertRow(insert_at)
+        self.ensure_items(insert_at)
+        self.setCurrentCell(insert_at, 0)
+        self.editItem(self.item(insert_at, 0))
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.handle_enter_action()
+            return
+        super().keyPressEvent(e)
+
 # ------------------- IA helpers (comunes) --------------
 
 import unicodedata
@@ -209,60 +389,328 @@ def safe_json_loads(s: str) -> Dict[str, Any]:
     try:
         return json.loads(s or "{}")
     except Exception:
-        # Algunos modelos devuelven comillas simples: intenta arreglar rápido
+        return {}
+
+# ------------------- AUTOMATIZACIÓN TGP -------------------
+
+class TgpAutomationWorker(QThread):
+    """Abre/cierra TGP, login 'visa', Clicks 2.1 → **espera 5s** → (VENTANA de confirmación) →
+    Clicks 2.2 (Ctrl+B x veces) → traspaso de tabla → pregunta impresión.
+    Parada de emergencia con ESC en cualquier momento.
+    """
+
+    # Señales hacia la UI
+    log = pyqtSignal(str)
+    need_user_pause = pyqtSignal(str)    # diálogo de pausa ("Aceptar / Cancelar")
+    ask_print = pyqtSignal()             # pedir decisión de impresión
+    show_info = pyqtSignal(str)          # info final
+    finished_ok = pyqtSignal()
+    aborted = pyqtSignal(str)
+
+    def __init__(self, tgp_path: str, rows_to_transfer: List[Dict[str, str]]):
+        super().__init__()
+        self.tgp_path = tgp_path
+        self.rows = rows_to_transfer or []
+
+        # Flags de control
+        self._pause_flag = threading.Event()
+        self._resume_flag = threading.Event()
+        self._cancel_flag = threading.Event()
+
+        # Decisión de impresión
+        self._print_event = threading.Event()
+        self._print_choice: Optional[bool] = None
+
+        # Supresión de pausa mientras inyectamos input
+        self._suppress_until = 0.0
+
+    # ---------- Control desde el listener global ----------
+    def _now(self) -> float:
+        import time as _t
+        return _t.time()
+
+    def _suppress_for(self, seconds: float):
+        self._suppress_until = max(self._suppress_until, self._now() + max(0.0, seconds))
+
+    def is_inputting(self) -> bool:
+        return self._now() < self._suppress_until
+
+    # [NEW] Cancelación inmediata (emergencia ESC)
+    def cancel_now(self):  # llamado desde listener
+        self._cancel_flag.set()
+        self._resume_flag.set()  # por si está en pausa/espera
+        self.log.emit("[EMERGENCIA] Cancelación inmediata solicitada (ESC).")
+
+    def request_global_pause(self):
+        """(Compatibilidad; no usamos una pausa manual distinta a ESC)"""
+        self._pause_flag.set()
+        self._resume_flag.clear()
+        self.need_user_pause.emit("user-request")
+
+    def continue_after_pause(self):
+        self._pause_flag.clear()
+        self._resume_flag.set()
+
+    def cancel_after_pause(self):
+        self._cancel_flag.set()
+        self._resume_flag.set()
+
+    # Decisión de impresión desde la UI
+    def set_print_decision(self, do_print: bool):
+        self._print_choice = bool(do_print)
+        self._print_event.set()
+
+    # ---------- Helpers de input ----------
+    def _check_cancel(self):  # [NEW]
+        if self._cancel_flag.is_set():
+            raise RuntimeError("Cancelado por el usuario.")
+
+    def _sleep(self, sec: float):
+        import time as _t
+        # micro-sleeps para responder rápido a cancelaciones
+        end = _t.time() + max(0.0, sec)
+        while _t.time() < end:
+            self._check_cancel()
+            _t.sleep(0.02)
+
+    def _ensure_ctrls(self):
+        if keyboard is None or mouse is None:
+            raise RuntimeError("Falta 'pynput'. Instálalo para usar la automatización de TGP.")
+        self._kbd = keyboard.Controller()
+        self._mouse = mouse.Controller()
+
+    def _type_text(self, text: str, key_delay: float = 0.01):
+        """Escribe texto con supresión temporal de la pausa global."""
+        self._suppress_for(max(0.15, len(text) * (key_delay + 0.002)))
+        for ch in text:
+            self._check_cancel()  # [NEW]
+            self._kbd.type(ch)
+            self._sleep(key_delay)
+
+    def _press_key(self, k, times: int = 1, delay: float = 0.05):
+        self._suppress_for(max(0.15, times * (delay + 0.02)))
+        for _ in range(times):
+            self._check_cancel()  # [NEW]
+            self._kbd.press(k)
+            self._kbd.release(k)
+            self._sleep(delay)
+
+    def _hotkey_ctrl_b(self):
+        self._check_cancel()  # [NEW]
+        self._suppress_for(0.20)
+        self._kbd.press(keyboard.Key.ctrl)
+        self._kbd.press('b')
+        self._kbd.release('b')
+        self._kbd.release(keyboard.Key.ctrl)
+        self._sleep(0.06)
+
+    def _click_xy(self, x: int, y: int, btn=None):
+        self._check_cancel()  # [NEW]
+        btn = btn or mouse.Button.left
+        self._suppress_for(0.20)
+        self._mouse.position = (int(x), int(y))
+        self._sleep(0.05)
+        self._mouse.click(btn, 1)
+        self._sleep(0.15)
+
+    def _wait_or_abort(self, sec: float):
+        """Espera pasiva, pero aborta si el usuario canceló."""
+        step = 0.1
+        t = 0.0
+        while t < sec:
+            self._check_cancel()
+            self._sleep(step)
+            t += step
+
+    # ---------- Gestión de proceso TGP ----------
+    def _kill_existing_tgp(self):
+        if not psutil:
+            return
+        targets = ("tgp", "tgpro", "tgprofesional", "tg profesional")
+        for p in psutil.process_iter(attrs=["pid", "name", "exe"]):
+            try:
+                name = (p.info.get("name") or "").lower()
+                exe = (p.info.get("exe") or "").lower()
+                if any(t in name for t in targets) or any(t in exe for t in targets):
+                    self.log.emit(f"[TGP] Cerrando proceso previo: PID={p.pid}, name={p.info.get('name')}")
+                    p.terminate()
+            except Exception:
+                continue
+        self._wait_or_abort(1.5)
+
+    def _launch_tgp(self):
+        self.log.emit("[TGP] Abriendo aplicación…")
         try:
-            return json.loads(s.replace("'", '"'))
-        except Exception:
-            return {}
-
-def html_escape(t: str) -> str:
-    return (t or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-
-# Conversión rápida de tablas Markdown a HTML (fallback)
-def markdown_table_to_html(text: str) -> Optional[str]:
-    lines = [ln.rstrip() for ln in (text or "").splitlines()]
-    rows = [ln for ln in lines if ln.strip().startswith("|") and ln.strip().endswith("|")]
-    if not rows:
-        return None
-    # Elimina la línea separadora si existe (----)
-    if len(rows) >= 2 and set(rows[1].replace("|","").strip()) <= set("-: "):
-        rows.pop(1)
-    def split_row(r): return [c.strip() for c in r.strip("|").split("|")]
-    cells = [split_row(r) for r in rows]
-    if not cells: return None
-    header = cells[0]
-    body = cells[1:] if len(cells) > 1 else []
-    # Construye HTML simple compatible con correo
-    def td(tag, v): return f"<{tag} style='border:1px solid #ccc;padding:6px 8px'>{html_escape(v)}</{tag}>"
-    thead = "<tr>" + "".join(td("th", h) for h in header) + "</tr>"
-    tbody = "".join("<tr>"+ "".join(td("td", v) for v in row) + "</tr>" for row in body)
-    table = (
-        "<table style='border-collapse:collapse;border:1px solid #ccc;font-family:Arial;font-size:12px'>"
-        f"<thead>{thead}</thead><tbody>{tbody}</tbody></table>"
-    )
-    # Devuelve el bloque completo reemplazando la sección en el texto original
-    html_blocks = []
-    in_table = False
-    for ln in lines:
-        if ln.strip().startswith("|") and ln.strip().endswith("|"):
-            if not in_table:
-                in_table = True
-                continue
+            if self.tgp_path.lower().endswith(".lnk") and sys.platform.startswith("win"):
+                os.startfile(self.tgp_path)  # type: ignore
             else:
-                continue
-        else:
-            if in_table:
-                in_table = False
-                html_blocks.append(table)
-            html_blocks.append(html_escape(ln))
-    if in_table:
-        html_blocks.append(table)
-    return "<br>".join(html_blocks)
+                creationflags = subprocess.DETACHED_PROCESS if sys.platform == "win32" else 0
+                subprocess.Popen([self.tgp_path], creationflags=creationflags)
+        except Exception as e:
+            raise RuntimeError(f"No se pudo iniciar TGP: {human_ex(e)}")
+        self._wait_or_abort(3.5)
 
-# ------------------- Opción A (Extractor TGP) ----------
+    def _login_with_visa(self):
+        # [FIX] respeta tu timing para evitar que los clicks siguientes se encimen
+        self.log.emit("[TGP] Login: escribiendo 'visa' y ENTER (x2)…")
+        self._type_text("visa", key_delay=0.02)
+        self._wait_or_abort(0.35)
+        self._press_key(keyboard.Key.enter, times=2, delay=0.12)
+        self._wait_or_abort(3.0)
+
+    # ---------- Secuencias Clicks ----------
+    def _do_clicks_2_1(self):
+        """Clicks 2.1 con 500ms entre clics."""
+        self.log.emit("[TGP] Clicks 2.1…")
+        self._click_xy(427, 102); self._wait_or_abort(0.5)
+        self._click_xy(86, 161);  self._wait_or_abort(0.5)
+        self._click_xy(98, 174);  self._wait_or_abort(0.5)
+
+    def _do_clicks_2_2(self):
+        self.log.emit("[TGP] Clicks 2.2 (Ctrl+B + Enter x25)…")
+        self._click_xy(23, 342)  # foco en la grilla
+        self._wait_or_abort(0.5)
+        for _ in range(25):
+            self._check_cancel()  # [NEW]
+            self._hotkey_ctrl_b()
+            self._press_key(keyboard.Key.enter, times=1, delay=0.06)
+
+    # ---------- Pausa guiada ----------
+    def _pause_for_user_to_pick_client(self):
+        self.log.emit("[TGP] Pausa: selecciona cliente/pedido y pulsa Aceptar.")
+        self._pause_flag.set()
+        self._resume_flag.clear()
+        self.need_user_pause.emit("select-client")
+        while not self._resume_flag.is_set():
+            self._check_cancel()  # [NEW]
+            self._sleep(0.1)
+        self._pause_flag.clear()
+        self.log.emit("[TGP] Reanudando…")
+        self._wait_or_abort(0.3)
+
+    # ---------- Traspaso tabla a TGP ----------
+    def _focus_description_field(self):
+        self.log.emit("[TGP] Foco en 'Descripción' (221,343)…")
+        self._click_xy(221, 343)
+        self._wait_or_abort(0.25)
+
+    def _transfer_all_rows(self):
+        if not self.rows:
+            self.log.emit("[TGP] No hay filas para transferir.")
+            return
+        self._focus_description_field()
+
+        for idx, r in enumerate(self.rows, start=1):
+            self._check_cancel()  # [NEW]
+            desc = (r.get("descripcion") or "").strip()
+            qty  = (r.get("cantidad") or "").strip()
+            prc  = (r.get("precio") or "").strip()
+            self.log.emit(f"[TGP] Fila {idx}: DESC='{desc}' | CANT='{qty}' | PRECIO='{prc}'")
+
+            # Descripción
+            if desc:
+                self._type_text(desc, key_delay=0.01)
+            self._press_key(keyboard.Key.enter, times=1, delay=0.08)
+
+            # → Cantidad
+            self._press_key(keyboard.Key.right, times=1, delay=0.06)
+            if qty:
+                self._type_text(qty, key_delay=0.01)
+                self._press_key(keyboard.Key.enter, times=1, delay=0.08)  # solo si hay cantidad
+
+            # →→ Precio
+            self._press_key(keyboard.Key.right, times=2, delay=0.06)
+            if prc:
+                self._type_text(prc, key_delay=0.01)
+                self._press_key(keyboard.Key.enter, times=1, delay=0.08)  # solo si hay precio
+
+            # ↓ nueva fila y volver a Descripción con ← ← ←
+            self._press_key(keyboard.Key.down, times=1, delay=0.08)
+            self._press_key(keyboard.Key.left, times=3, delay=0.06)
+
+        self.log.emit("[TGP] Transferencia completada.")
+
+    # ---------- Decisión y secuencia de impresión ----------
+    def _ask_print_decision(self) -> bool:
+        self._print_event.clear()
+        self._print_choice = None
+        self.ask_print.emit()  # la UI mostrará el diálogo y llamará a set_print_decision()
+        while not self._print_event.is_set():
+            self._check_cancel()  # [NEW]
+            self._sleep(0.1)
+        return bool(self._print_choice)
+
+        # Dentro de la clase TgpAutomationWorker
+    def _do_print_sequence(self):
+        """
+        Secuencia de impresión con CUATRO clics (el 1.º es el nuevo):
+        (518,298) -> (505,57) -> (735,384) -> (758,685)
+        500 ms entre clics para evitar solapamientos.
+        """
+        if mouse is None:
+            raise RuntimeError("Falta 'pynput' (mouse) para usar la impresión automatizada.")
+
+        # 1) Click previo solicitado
+        self._click_xy(26, 341, btn=mouse.Button.left)
+        self._wait_or_abort(0.5)
+        
+        self._click_xy(26, 341, btn=mouse.Button.left)
+        self._wait_or_abort(0.5)
+
+        # 2) Click 1 original
+        self._click_xy(505, 57)
+        self._wait_or_abort(0.5)
+
+        # 3) Click 2 original
+        self._click_xy(735, 384)
+        self._wait_or_abort(0.5)
+
+        # 4) Click 3 original
+        self._click_xy(758, 685)
+        self._wait_or_abort(0.5)
+
+
+    # ---------- Orquestación principal ----------
+    def run(self):
+        try:
+            self._ensure_ctrls()
+
+            # 1) Cerrar TGP si estaba abierto
+            self._kill_existing_tgp(); self._check_cancel()
+
+            # 2) Abrir TGP
+            self._launch_tgp(); self._check_cancel()
+
+            # 3) Login con 'visa'
+            self._login_with_visa(); self._check_cancel()
+
+            # 4) Clicks 2.1
+            self._do_clicks_2_1(); self._check_cancel()
+
+            # 6) ⚠️ Ventana de confirmación ANTES del bucle Ctrl+B
+            self._pause_for_user_to_pick_client(); self._check_cancel()
+
+            # 7) Clicks 2.2 (post-confirmación)
+            self._do_clicks_2_2(); self._check_cancel()
+
+            # 8) Traspaso de la tabla
+            self._transfer_all_rows(); self._check_cancel()
+
+            # 9) Preguntar si desea imprimir y ejecutar la secuencia de impresión
+            if self._ask_print_decision():
+                self._do_print_sequence()
+                self.show_info.emit("Se completó con éxito.")
+
+            # 10) Fin
+            self.finished_ok.emit()
+
+        except Exception as e:
+            self.aborted.emit(human_ex(e))
+
+# ------------------- Opción A (Extractor + TGP) ----------
 
 class OptionAPage(QWidget):
-    """Extractor de datos de facturas tipo TGP (PDF 1:1 / Imagen con IA)."""
+    """Extractor de datos de facturas + Automatización TGP (auto-run)."""
     def __init__(self, parent_main):
         super().__init__()
         self.main = parent_main
@@ -272,6 +720,11 @@ class OptionAPage(QWidget):
         self.mime: Optional[str] = None
         self.src_path: Optional[str] = None
         self.pdf_rows: Optional[List[Dict[str, str]]] = None
+        self._populating = False
+
+        # TGP runtime
+        self._tgp_worker: Optional[TgpAutomationWorker] = None
+        self._tgp_listener = None  # keyboard.Listener
 
         self.prompt_count_a = (
             "Cuenta cuántos RENGLONES visibles conforman el CUERPO de la tabla de productos de la factura. "
@@ -297,6 +750,77 @@ class OptionAPage(QWidget):
 
         self._build_ui()
 
+    # ----------- utilidades tabla ----------
+    def _collect_rows_from_table(self) -> List[Dict[str, str]]:
+        rows: List[Dict[str, str]] = []
+        for r in range(self.table.rowCount()):
+            d = (self.table.item(r, 0).text() if self.table.item(r, 0) else "").strip()
+            c = (self.table.item(r, 1).text() if self.table.item(r, 1) else "").strip()
+            p = (self.table.item(r, 2).text() if self.table.item(r, 2) else "").strip()
+            if d or c or p:
+                rows.append({"descripcion": d, "cantidad": c, "precio": p})
+        return rows
+
+    # ----------- TGP helpers (auto-run) -----------
+    def _start_global_listener(self):
+        if keyboard is None:
+            print("[TGP] Advertencia: no se pudo iniciar listener global (instala 'pynput').")
+            return
+
+        # [FIX] ESC ahora cancela inmediatamente (no pausa)
+        def on_press(k):
+            if self._tgp_worker:
+                try:
+                    if k == keyboard.Key.esc:
+                        print("[EMERGENCIA] ESC detectado → cancel_now()")
+                        self._tgp_worker.cancel_now()
+                except Exception:
+                    pass
+
+        self._tgp_listener = keyboard.Listener(on_press=on_press)
+        self._tgp_listener.start()
+        print("[EMERGENCIA] Listener GLOBAL activo. Pulsa ESC para CANCELAR de inmediato.")
+
+    def _stop_global_listener(self):
+        if self._tgp_listener:
+            try:
+                self._tgp_listener.stop()
+            except Exception:
+                pass
+            self._tgp_listener = None
+
+    def _on_tgp_pause_dialog(self, _reason: str):
+        # Ventana de confirmación ANTES del bucle Ctrl+B
+        m = QMessageBox(self)
+        m.setIcon(QMessageBox.Icon.Question)
+        m.setWindowTitle("Confirmación — Selecciona cliente")
+        m.setText(
+            "Selecciona el **cliente/pedido** en TGP.\n\n"
+            "Cuando estés listo, pulsa **Aceptar** para continuar.\n"
+            "O pulsa **Cancelar** para abortar la secuencia."
+        )
+        aceptar = m.addButton("Aceptar", QMessageBox.ButtonRole.AcceptRole)
+        cancelar = m.addButton("Cancelar", QMessageBox.ButtonRole.RejectRole)
+        m.exec()
+        if self._tgp_worker:
+            if m.clickedButton() == aceptar:
+                self._tgp_worker.continue_after_pause()
+            else:
+                self._tgp_worker.cancel_after_pause()
+
+    def _on_tgp_ask_print(self):
+        m = QMessageBox(self)
+        m.setIcon(QMessageBox.Icon.Question)
+        m.setWindowTitle("¿Imprimir?")
+        m.setText("La tabla se traspasó correctamente.\n\n¿Quieres imprimir ahora?")
+        b_print = m.addButton("Imprimir", QMessageBox.ButtonRole.AcceptRole)
+        b_cancel = m.addButton("Cancelar", QMessageBox.ButtonRole.RejectRole)
+        m.exec()
+        if self._tgp_worker:
+            self._tgp_worker.set_print_decision(m.clickedButton() == b_print)
+
+    # ----------- UI -----------
+
     def _build_ui(self):
         root = QVBoxLayout(self)
 
@@ -319,40 +843,108 @@ class OptionAPage(QWidget):
         self.drop = DropImage(self)
         self.drop.image_loaded.connect(self._on_loaded)
 
-        # Tabla
-        from PyQt6.QtWidgets import QTableWidget, QTableWidgetItem, QHeaderView
-        self.table = QTableWidget(0, 3)
+        self.table = EditableTable(0, 3)
         self.table.setHorizontalHeaderLabels(["Descripción", "Cantidad", "Precio"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
+        self.table.setItemDelegate(EnterKeyDelegate(self.table))
+        self.table.currentCellChanged.connect(self._on_current_cell_changed)
 
         content.addWidget(self.drop, 1)
         content.addWidget(self.table, 1)
-        root.addLayout(content)
+        root.addLayout(content, 1)
 
-        # Bottom
-        bb = QHBoxLayout()
+        # Cámara / barra inferior
+        self._cap = None
+        self._cam_timer = QTimer(self); self._cam_timer.setInterval(33)
+        self._cam_timer.timeout.connect(self._update_preview_A)
+        self._last_frame_a = None
+        self._rot_a = 0
+
+        footer = QHBoxLayout()
+        self.cam_combo_a = QComboBox()
+        self.cam_combo_a.addItem("Ninguna (arrastrar imagen)", -1)
+        self.btn_rot_l_a = QPushButton("↺"); self.btn_rot_l_a.setFixedWidth(30)
+        self.btn_rot_r_a = QPushButton("↻"); self.btn_rot_r_a.setFixedWidth(30)
+        self.btn_rot_l_a.clicked.connect(lambda: self._set_rot_a(-90))
+        self.btn_rot_r_a.clicked.connect(lambda: self._set_rot_a(+90))
+        self.chk_autocrop_a = QCheckBox("Auto-crop")
+        self.chk_autocrop_a.setChecked(True)
+        self.chk_autocrop_a.stateChanged.connect(lambda *_: self._render_preview_a())
+        self.btn_capture_a = QPushButton("Capturar imagen")
+        self.btn_capture_a.clicked.connect(self._capture_frame_A)
+        self._populate_cameras_A()
+        self.cam_combo_a.currentIndexChanged.connect(self._on_cam_changed_A)
+
         self.btn_open = QPushButton("Abrir archivo…")
         self.btn_open.clicked.connect(self._open_file)
+
+        # Procesar = AUTOMATIZACIÓN TGP
         self.btn_proc = QPushButton("Procesar")
-        self.btn_proc.clicked.connect(self._process)
-        self.btn_proc.setEnabled(False)
-        bb.addStretch(1); bb.addWidget(self.btn_open); bb.addWidget(self.btn_proc)
-        root.addLayout(bb)
+        self.btn_proc.clicked.connect(self._run_tgp_automation)
+
+        footer.addWidget(self.cam_combo_a, 3)
+        footer.addSpacing(6)
+        footer.addWidget(self.btn_rot_l_a); footer.addWidget(self.btn_rot_r_a)
+        footer.addSpacing(8)
+        footer.addWidget(self.chk_autocrop_a)
+        footer.addSpacing(8)
+        footer.addWidget(self.btn_capture_a)
+        footer.addStretch(1)
+        footer.addWidget(self.btn_open)
+        footer.addWidget(self.btn_proc)
+        root.addLayout(footer)
 
         # Timer para tomar API de settings
         self._api_timer = QTimer(self); self._api_timer.setInterval(800); self._api_timer.setSingleShot(True)
         self._api_timer.timeout.connect(self._refresh_api_key)
         self._api_timer.start()
 
+    # <<< Método propio (no anidado) >>>
+    def _run_tgp_automation(self):
+        # Ruta desde Configuración
+        tgp_path = self.main.settings.value("paths/tgp_path", "", str).strip()
+        if not tgp_path or not os.path.exists(tgp_path):
+            QMessageBox.warning(self, "TGP", "Configura la ruta del .exe/.lnk en Configuración → General.")
+            return
+        if self._tgp_worker and self._tgp_worker.isRunning():
+            QMessageBox.information(self, "TGP", "Ya hay una secuencia en ejecución.")
+            return
+
+        # Recolectar filas de la tabla (para el traspaso)
+        rows = self._collect_rows_from_table()
+        if not rows:
+            ok = QMessageBox.question(
+                self, "TGP — Sin filas",
+                "La tabla está vacía. ¿Deseas continuar de todos modos?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if ok != QMessageBox.StandardButton.Yes:
+                return
+
+        # Listener global (ESC = cancelación inmediata)
+        self._start_global_listener()
+
+        # Worker
+        self._tgp_worker = TgpAutomationWorker(tgp_path, rows)
+        self._tgp_worker.log.connect(lambda s: print(s.strip()))
+        self._tgp_worker.need_user_pause.connect(self._on_tgp_pause_dialog)
+        self._tgp_worker.ask_print.connect(self._on_tgp_ask_print)
+        self._tgp_worker.show_info.connect(lambda msg: QMessageBox.information(self, "TGP", msg))
+        self._tgp_worker.finished_ok.connect(lambda: QMessageBox.information(self, "TGP", "Secuencia finalizada."))
+        # [FIX] Mensaje emergente al cancelar
+        self._tgp_worker.aborted.connect(lambda msg: QMessageBox.critical(self, "TGP", f"Secuencia cancelada: {msg}"))
+        self._tgp_worker.finished.connect(self._stop_global_listener)
+        self._tgp_worker.start()
+
+    # ---------- IA (mantiene pipeline) ----------
     def _refresh_api_key(self):
         key = self.main.settings.value("accounts/google_api_key", "", str).strip()
         self.api_key = key or None
         print(f"[TGP] API Key cargada: {'sí' if self.api_key else 'no'}")
-        self.btn_proc.setEnabled(bool(self.api_key and self.drop.bytes))
 
     def _on_loaded(self, path: str):
         self.src_path = path
@@ -393,14 +985,28 @@ class OptionAPage(QWidget):
             QApplication.restoreOverrideCursor()
 
     def _populate(self, rows: List[Dict[str, Any]]):
-        from PyQt6.QtWidgets import QTableWidgetItem
-        self.table.setRowCount(0)
-        for obj in rows:
-            r = self.table.rowCount()
-            self.table.insertRow(r)
-            self.table.setItem(r, 0, QTableWidgetItem(str(obj.get("descripcion", ""))))
-            self.table.setItem(r, 1, QTableWidgetItem(str(obj.get("cantidad", ""))))
-            self.table.setItem(r, 2, QTableWidgetItem(str(obj.get("precio", ""))))
+        self._populating = True
+        try:
+            self.table.setRowCount(0)
+            for obj in rows:
+                r = self.table.rowCount()
+                self.table.insertRow(r)
+                self.table.setItem(r, 0, QTableWidgetItem(str(obj.get("descripcion", ""))))
+                self.table.setItem(r, 1, QTableWidgetItem(str(obj.get("cantidad", ""))))
+                self.table.setItem(r, 2, QTableWidgetItem(str(obj.get("precio", ""))))
+        finally:
+            self._populating = False
+
+    def _on_current_cell_changed(self, r: int, c: int, prev_r: int, prev_c: int):
+        if self._populating:
+            return
+        if prev_r is not None and prev_r >= 0 and prev_r < self.table.rowCount():
+            if self.table.row_all_blank(prev_r):
+                try:
+                    self.table.currentCellChanged.disconnect(self._on_current_cell_changed)
+                    self.table.removeRow(prev_r)
+                finally:
+                    self.table.currentCellChanged.connect(self._on_current_cell_changed)
 
     # ---- PDF parser 1:1
     def _rows_from_pdf(self, pdf_path: str) -> Optional[List[Dict[str, str]]]:
@@ -496,18 +1102,27 @@ class OptionAPage(QWidget):
         model = genai.GenerativeModel("gemini-1.5-flash-latest")
         part = {"mime_type": self.drop.mime, "data": self.drop.bytes}
 
-        # Conteo A
         schema_a = {"type": "OBJECT","properties": {"row_count": {"type": "INTEGER"}},"required": ["row_count"]}
         cfg_a = GenerationConfig(response_mime_type="application/json", response_schema=schema_a, temperature=0.0)
         resp_a = model.generate_content([self.prompt_count_a, part], generation_config=cfg_a)
         raw_a = getattr(resp_a, "text", "") or "{}"
-        try: n_a = int(safe_json_loads(raw_a).get("row_count", 0))
-        except Exception: n_a = 0
+        try:
+            n_a = int(safe_json_loads(raw_a).get("row_count", 0))
+        except Exception:
+            n_a = 0
 
-        # Conteo B
         schema_b = {
             "type": "OBJECT",
-            "properties": {"lines": {"type": "ARRAY","items": {"type": "OBJECT","properties": {"y": {"type": "NUMBER"}, "text": {"type": "STRING"}}, "required": ["y","text"]}}},
+            "properties": {
+                "lines": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {"y": {"type": "NUMBER"}, "text": {"type": "STRING"}},
+                        "required": ["y", "text"]
+                    }
+                }
+            },
             "required": ["lines"]
         }
         cfg_b = GenerationConfig(response_mime_type="application/json", response_schema=schema_b, temperature=0.0)
@@ -525,7 +1140,6 @@ class OptionAPage(QWidget):
             n_b = len(dedup)
         except Exception:
             n_b = 0
-
         n = max(n_a, n_b)
         return n if n > 0 else 1
 
@@ -535,19 +1149,33 @@ class OptionAPage(QWidget):
         schema = {
             "type": "OBJECT",
             "properties": {
-                "rows": {"type": "ARRAY","items": {"type": "OBJECT","properties": {"descripcion": {"type": "STRING"}, "cantidad": {"type": "STRING"}, "precio": {"type": "STRING"}}, "required": ["descripcion","cantidad","precio"]}}
+                "rows": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "descripcion": {"type": "STRING"},
+                            "cantidad": {"type": "STRING"},
+                            "precio": {"type": "STRING"}
+                        },
+                        "required": ["descripcion", "cantidad", "precio"]
+                    }
+                }
             },
             "required": ["rows"]
         }
         cfg = GenerationConfig(response_mime_type="application/json", response_schema=schema, temperature=0.0)
-
         prompt = self.prompt_rows_image_strict.replace("<<N_ROWS>>", str(n))
         part = {"mime_type": self.drop.mime, "data": self.drop.bytes}
         resp = model.generate_content([prompt, part], generation_config=cfg)
         raw = getattr(resp, "text", "") or "{}"
         data = safe_json_loads(raw)
         rows = data.get("rows", [])
-        clean = [{"descripcion": str(r.get("descripcion", "")), "cantidad": first_number_or_blank(r.get("cantidad", "")), "precio": first_number_or_blank(r.get("precio", ""))} for r in rows]
+        clean = [{
+            "descripcion": str(r.get("descripcion", "")),
+            "cantidad": first_number_or_blank(r.get("cantidad", "")),
+            "precio": first_number_or_blank(r.get("precio", "")),
+        } for r in rows]
         return clean
 
     def _repair_to_n(self, rows: List[Dict[str, str]], n: int) -> List[Dict[str, str]]:
@@ -555,7 +1183,20 @@ class OptionAPage(QWidget):
         model = genai.GenerativeModel("gemini-1.5-flash-latest")
         schema = {
             "type": "OBJECT",
-            "properties": {"rows": {"type": "ARRAY","items": {"type": "OBJECT","properties": {"descripcion": {"type": "STRING"}, "cantidad": {"type": "STRING"}, "precio": {"type": "STRING"}}, "required": ["descripcion","cantidad","precio"]}}},
+            "properties": {
+                "rows": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "descripcion": {"type": "STRING"},
+                            "cantidad": {"type": "STRING"},
+                            "precio": {"type": "STRING"}
+                        },
+                        "required": ["descripcion", "cantidad", "precio"]
+                    }
+                }
+            },
             "required": ["rows"]
         }
         cfg = GenerationConfig(response_mime_type="application/json", response_schema=schema, temperature=0.0)
@@ -570,23 +1211,145 @@ class OptionAPage(QWidget):
         resp = model.generate_content([prompt, part], generation_config=cfg)
         raw = getattr(resp, "text", "") or "{}"
         data = safe_json_loads(raw)
-        fixed = [{"descripcion": str(r.get("descripcion", "")), "cantidad": first_number_or_blank(r.get("cantidad", "")), "precio": first_number_or_blank(r.get("precio", ""))} for r in data.get("rows", [])]
+        fixed = [{
+            "descripcion": str(r.get("descripcion", "")),
+            "cantidad": first_number_or_blank(r.get("cantidad", "")),
+            "precio": first_number_or_blank(r.get("precio", "")),
+        } for r in data.get("rows", [])]
         if len(fixed) < n:
             fixed += [{"descripcion": "", "cantidad": "", "precio": ""} for _ in range(n - len(fixed))]
         if len(fixed) > n:
             fixed = fixed[:n]
         return fixed
 
+    # ---------- Cámara: helpers Option A ----------
+    def _populate_cameras_A(self):
+        while self.cam_combo_a.count() > 1:
+            self.cam_combo_a.removeItem(1)
+
+        found = 0
+        backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF]
+        for idx in range(0, 6):
+            for be in backends:
+                cap = cv2.VideoCapture(idx, be)
+                if cap.isOpened():
+                    ok, _ = cap.read()
+                    cap.release()
+                    if ok:
+                        self.cam_combo_a.addItem(f"Cámara {idx}", idx)
+                        print(f"[Cam-A] Detectada cámara #{idx}")
+                        found += 1
+                        break
+                else:
+                    cap.release()
+        if hasattr(self, "btn_capture_a"):
+            self.btn_capture_a.setEnabled(found > 0)
+        print(f"[Cam-A] Total cámaras: {found}")
+
+    def _on_cam_changed_A(self, _i: int):
+        cam_index = self.cam_combo_a.currentData()
+        self._stop_preview_A()
+        if cam_index is None or int(cam_index) == -1:
+            self.drop.reset_placeholder()
+        else:
+            self._start_preview_A(int(cam_index))
+
+    def _start_preview_A(self, index: int):
+        self._cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+        if not self._cap.isOpened():
+            QMessageBox.critical(self, "Cámara", "No se pudo abrir la cámara seleccionada.")
+            self._cap = None
+            return
+        self._cam_timer.start()
+
+    def _stop_preview_A(self):
+        self._cam_timer.stop()
+        if self._cap:
+            try:
+                self._cap.release()
+            except Exception:
+                pass
+            self._cap = None
+
+    def _set_rot_a(self, delta: int):
+        self._rot_a = (self._rot_a + delta) % 360
+        self._render_preview_a()
+
+    def _render_preview_a(self):
+        if self._last_frame_a is None:
+            return
+        frame = self._last_frame_a.copy()
+        if self._rot_a == 90:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        elif self._rot_a == 180:
+            frame = cv2.rotate(frame, cv2.ROTATE_180)
+        elif self._rot_a == 270:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+        if self.chk_autocrop_a.isChecked() and self.drop.width() > 0 and self.drop.height() > 0:
+            h, w = frame.shape[:2]
+            target_aspect = self.drop.width() / max(1, self.drop.height())
+            frame_aspect = w / max(1, h)
+            if abs(frame_aspect - target_aspect) > 1e-3:
+                if frame_aspect > target_aspect:
+                    new_w = int(h * target_aspect)
+                    x0 = max(0, (w - new_w) // 2)
+                    frame = frame[:, x0:x0 + new_w]
+                else:
+                    new_h = int(w / target_aspect)
+                    y0 = max(0, (h - new_h) // 2)
+                    frame = frame[y0:y0 + new_h, :]
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
+        self.drop.show_qimage(qimg)
+
+    def _update_preview_A(self):
+        if not self._cap:
+            return
+        ok, frame = self._cap.read()
+        if not ok:
+            return
+        self._last_frame_a = frame
+        self._render_preview_a()
+
+    def _capture_frame_A(self):
+        cam_index = self.cam_combo_a.currentData()
+        if cam_index is None or cam_index == -1:
+            QMessageBox.warning(self, "Cámara", "Selecciona una cámara distinta de 'Ninguna'.")
+            return
+        if self._last_frame_a is None:
+            QMessageBox.warning(self, "Cámara", "Aún no hay imagen de la cámara.")
+            return
+        frame = self._last_frame_a.copy()
+        if self._rot_a == 90:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        elif self._rot_a == 180:
+            frame = cv2.rotate(frame, cv2.ROTATE_180)
+        elif self._rot_a == 270:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+        tmp = resource_path("_captura_factura_tmp.png")
+        cv2.imwrite(tmp, frame)
+        self.drop.load_path(tmp)
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+    def stop_camera(self):
+        self._stop_preview_A()
+
 # ------------------- IA worker (Opción B) ------------
 
 class EmailGenWorker(QThread):
-    finished = pyqtSignal(str, str, str)  # subject, html, text
+    finished = pyqtSignal(str, str)
     failed = pyqtSignal(str)
-    def __init__(self, api_key: str, recipient_name: str, sender_name: str, img_bytes: bytes, mime: str):
+    def __init__(self, api_key: str, recipient_name: str, img_bytes: bytes, mime: str):
         super().__init__()
         self.api_key = api_key
         self.recipient_name = recipient_name.strip()
-        self.sender_name = sender_name.strip()
         self.img_bytes = img_bytes
         self.mime = mime or "image/png"
     def run(self):
@@ -595,49 +1358,27 @@ class EmailGenWorker(QThread):
             model = genai.GenerativeModel("gemini-1.5-flash-latest")
             schema = {
                 "type": "OBJECT",
-                "properties": {
-                    "subject": {"type": "STRING"},
-                    "body_html": {"type": "STRING"},
-                    "body_text": {"type": "STRING"}
-                },
-                "required": ["subject","body_html"]
+                "properties": {"subject": {"type": "STRING"}, "body": {"type": "STRING"}},
+                "required": ["subject", "body"]
             }
             cfg = GenerationConfig(response_mime_type="application/json", response_schema=schema, temperature=0.2)
             prompt = (
-                "Lee el texto manuscrito/impreso de la imagen y genera un correo de SOLICITUD DE COTIZACIÓN.\n"
-                f"- Saluda al destinatario por su nombre si está disponible: {self.recipient_name or '[Nombre del destinatario]'}.\n"
-                "- Devuelve SIEMPRE una versión HTML (body_html) y, si puedes, también texto plano (body_text).\n"
-                "- IMPORTANTÍSIMO: en HTML usa una TABLA <table> con borde (border-collapse), estilo inline, 3 columnas: Ítem | Cantidad | Detalle.\n"
-                "- No inventes datos; si faltan, usa descripciones genéricas.\n"
-                "- Termina con 'Atentamente,' y un marcador [Tu Nombre] que luego yo reemplazo por el nombre/empresa del remitente.\n"
-                "Devuelve SOLO JSON con 'subject', 'body_html' y opcionalmente 'body_text'."
+                "Lee el texto manuscrito/imprimido de la imagen y genera un correo de solicitud de cotización.\n"
+                f"- Destinatario: {self.recipient_name or '[Nombre del destinatario]'}\n"
+                "- Usa una tabla estilo Markdown con tuberías para listar ítems (| Ítem | Cantidad | Detalle |).\n"
+                "- Devuelve un asunto breve y un cuerpo formal, en español.\n"
+                "- No inventes datos; si faltan, deja texto genérico.\n"
+                "Devuelve SOLO JSON con 'subject' y 'body'."
             )
             part = {"mime_type": self.mime, "data": self.img_bytes}
             resp = model.generate_content([prompt, part], generation_config=cfg)
             raw = getattr(resp, "text", "") or "{}"
             data = safe_json_loads(raw)
             subject = (data.get("subject") or "").strip() or "Solicitud de cotización"
-            body_html = (data.get("body_html") or "").strip()
-            body_text = (data.get("body_text") or "").strip()
-
-            # Reemplazo de destinatario y remitente
+            body = (data.get("body") or "").strip()
             if self.recipient_name:
-                body_html = body_html.replace("[Nombre del destinatario]", self.recipient_name)
-                body_text = body_text.replace("[Nombre del destinatario]", self.recipient_name)
-            if self.sender_name:
-                body_html = body_html.replace("[Tu Nombre]", self.sender_name)
-                body_text = body_text.replace("[Tu Nombre]", self.sender_name)
-
-            # Fallback: si no vino HTML, intenta convertir tablas estilo Markdown
-            if not body_html:
-                pt_html = html_escape(body_text).replace("\n", "<br>")
-                body_html = markdown_table_to_html(body_text) or f"<div style='font-family:Arial'>{pt_html}</div>"
-
-            if not body_text:
-                # Texto simple a partir del HTML (súper básico)
-                body_text = re.sub("<[^<]+?>", "", body_html).replace("&nbsp;"," ").replace("&amp;","&")
-
-            self.finished.emit(subject, body_html, body_text)
+                body = body.replace("[Nombre del destinatario]", self.recipient_name).replace("[Destinatario]", self.recipient_name)
+            self.finished.emit(subject, body)
         except Exception as e:
             self.failed.emit(human_ex(e))
 
@@ -648,9 +1389,130 @@ class OptionBPage(QWidget):
         super().__init__()
         self.main = parent_main
         self._ai_worker: Optional[EmailGenWorker] = None
-        self._last_html: str = ""
-        self._last_text: str = ""
+
+        # cámara (live)
+        self._cap: Optional[cv2.VideoCapture] = None
+        self._cam_timer = QTimer(self)
+        self._cam_timer.setInterval(33)  # ~30 FPS
+        self._cam_timer.timeout.connect(self._update_preview)
+        self._last_frame = None
+        self._rot = 0
+
+        # buffer del cuerpo (texto plano/markdown)
+        self._body_raw: str = ""
+
         self._build_ui()
+
+    def _compose_html_document(self, subj: str, body_text: str) -> str:
+        body_html = self._body_text_to_html(body_text)
+        return f"""
+        <html><head><meta charset='utf-8'>
+        <style>
+            body{{font-family:Arial,Helvetica,sans-serif; font-size:12pt; color:#222; line-height:1.6;}}
+            h2{{margin:0 0 12px; font-size:16pt;}}
+            hr{{border:none; border-top:1px solid #ddd; margin:10px 0 14px;}}
+            table{{border-collapse:collapse; width:100%; table-layout:fixed;}}
+            thead th{{background:#f6f8fa;border:1px solid #dfe3e8;padding:6px 8px;text-align:left;font-weight:600}}
+            tbody td{{border:1px solid #e6e9ef;padding:6px 8px;vertical-align:top}}
+            tr, td, th{{page-break-inside:avoid;}}
+            p{{margin:0 0 10px}}
+        </style>
+        </head><body>
+        <h2>{html_escape(subj)}</h2>
+        <hr/>
+        {body_html}
+        </body></html>
+        """.strip()
+
+    def print_preview(self):
+        """Genera PDF temporal → rasteriza a 300 ppp → imprime como imagen."""
+        try:
+            subj = (self.subject_edit.text().strip() or "Solicitud de cotización")
+            html = self._compose_html_document(subj, self._body_raw or self.body_edit.toPlainText())
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmpf:
+                tmp_pdf = tmpf.name
+            try:
+                pdf_printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+                pdf_printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+                pdf_printer.setOutputFileName(tmp_pdf)
+                pdf_printer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
+                pdf_printer.setPageMargins(QMarginsF(15, 15, 15, 15), QPageLayout.Unit.Millimeter)
+
+                doc = QTextDocument()
+                doc.setHtml(html)
+                doc.print(pdf_printer)
+                print(f"[PRINT] PDF temporal creado: {tmp_pdf}")
+            except Exception:
+                try:
+                    os.remove(tmp_pdf)
+                except Exception:
+                    pass
+                raise
+
+            images = render_pdf_to_qimages(tmp_pdf, dpi=300)
+            if not images:
+                raise RuntimeError("No se pudo rasterizar el PDF para imprimir.")
+
+            def is_virtual(info: QPrinterInfo) -> bool:
+                name = (info.printerName() or "").upper()
+                return any(k in name for k in ("PDF", "XPS", "ONENOTE", "FAX"))
+
+            printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+            chosen: Optional[QPrinterInfo] = None
+            try:
+                chosen = QPrinterInfo.defaultPrinter()
+            except Exception:
+                chosen = None
+
+            if chosen and chosen.printerName() and not is_virtual(chosen):
+                printer.setPrinterName(chosen.printerName())
+                print(f"[PRINT] Usando impresora: {chosen.printerName()}")
+            else:
+                dlg = QPrintDialog(printer, self)
+                dlg.setWindowTitle("Imprimir (como imagen)")
+                if dlg.exec() != QDialog.DialogCode.Accepted:
+                    try:
+                        os.remove(tmp_pdf)
+                    except Exception:
+                        pass
+                    return
+
+            printer.setResolution(300)
+            painter = QPainter()
+            if not painter.begin(printer):
+                raise RuntimeError("No se pudo iniciar la impresión.")
+
+            try:
+                for idx, image in enumerate(images):
+                    target_rect = painter.viewport()
+                    scaled_size = image.size()
+                    scaled_size.scale(target_rect.size(), Qt.AspectRatioMode.KeepAspectRatio)
+
+                    painter.setViewport(
+                        target_rect.x(),
+                        target_rect.y(),
+                        scaled_size.width(),
+                        scaled_size.height()
+                    )
+                    painter.setWindow(image.rect())
+                    painter.drawImage(0, 0, image)
+
+                    if idx < len(images) - 1:
+                        printer.newPage()
+            finally:
+                painter.end()
+
+            QMessageBox.information(self, "Imprimir", "Documento enviado a la impresora como imagen (300 ppp).")
+            print("[PRINT] Trabajo enviado correctamente (rasterizado 300 ppp).")
+        except Exception as e:
+            QMessageBox.critical(self, "Imprimir", f"No se pudo imprimir:\n{human_ex(e)}")
+        finally:
+            try:
+                if 'tmp_pdf' in locals() and os.path.exists(tmp_pdf):
+                    os.remove(tmp_pdf)
+            except Exception:
+                pass
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -681,13 +1543,27 @@ class OptionBPage(QWidget):
         cam_row = QHBoxLayout()
         self.cam_combo = QComboBox()
         self.cam_combo.addItem("Ninguna (arrastrar imagen)", -1)
-        self.btn_capture = QPushButton("Capturar imagen")
-        self.btn_capture.clicked.connect(self._capture_frame)
         self._populate_cameras()
         self.cam_combo.currentIndexChanged.connect(self._on_cam_changed)
 
-        cam_row.addWidget(self.cam_combo, 2)
-        cam_row.addWidget(self.btn_capture, 1)
+        self.btn_rot_l = QPushButton("↺"); self.btn_rot_l.setFixedWidth(30)
+        self.btn_rot_r = QPushButton("↻"); self.btn_rot_r.setFixedWidth(30)
+        self.btn_rot_l.clicked.connect(lambda: self._set_rot(-90))
+        self.btn_rot_r.clicked.connect(lambda: self._set_rot(+90))
+
+        self.chk_autocrop = QCheckBox("Auto-crop")
+        self.chk_autocrop.setChecked(True)
+
+        self.btn_capture = QPushButton("Capturar imagen")
+        self.btn_capture.clicked.connect(self._capture_frame)
+
+        cam_row.addWidget(self.cam_combo, 3)
+        cam_row.addSpacing(6)
+        cam_row.addWidget(self.btn_rot_l); cam_row.addWidget(self.btn_rot_r)
+        cam_row.addSpacing(8)
+        cam_row.addWidget(self.chk_autocrop)
+        cam_row.addSpacing(8)
+        cam_row.addWidget(self.btn_capture)
         left.addLayout(cam_row)
 
         cols.addLayout(left, 1)
@@ -709,26 +1585,34 @@ class OptionBPage(QWidget):
         right.addWidget(lbl_subj); right.addWidget(self.subject_edit)
 
         self.body_edit = QTextEdit()
-        self.body_edit.setPlaceholderText("Se generará un cuerpo en HTML con tabla al cargar una imagen.")
+        self.body_edit.setAcceptRichText(True)
+        self.body_edit.setPlaceholderText("Se generará automáticamente con IA al cargar una imagen.")
         right.addWidget(self.body_edit, 1)
 
         actions = QHBoxLayout()
         self.btn_pdf = QPushButton("DESCARGAR PDF")
+        self.btn_print = QPushButton("IMPRIMIR")
         self.btn_send = QPushButton("ENVIAR")
         self.btn_pdf.clicked.connect(self.export_pdf)
+        self.btn_print.clicked.connect(self.print_preview)
         self.btn_send.clicked.connect(self.send_email)
-        actions.addStretch(1); actions.addWidget(self.btn_pdf); actions.addWidget(self.btn_send)
+        actions.addStretch(1)
+        actions.addWidget(self.btn_pdf)
+        actions.addWidget(self.btn_print)
+        actions.addWidget(self.btn_send)
         right.addLayout(actions)
 
         cols.addLayout(right, 1)
 
-        # Auto-regeneración al cambiar nombre (debounce)
         self._regen_timer = QTimer(self); self._regen_timer.setSingleShot(True)
         self._regen_timer.timeout.connect(lambda: self._maybe_autogenerate(trigger="name-change"))
         self.to_edit.textChanged.connect(lambda: self._regen_timer.start(500))
 
-        # Regenerar cuando se cargue imagen
         self.drop.image_loaded.connect(lambda _p: self._maybe_autogenerate(trigger="image"))
+        self.body_edit.textChanged.connect(self._sync_raw_from_editor)
+
+    def _sync_raw_from_editor(self):
+        self._body_raw = self.body_edit.toPlainText().strip()
 
     # Cámaras
     def _populate_cameras(self):
@@ -762,28 +1646,90 @@ class OptionBPage(QWidget):
     def _on_cam_changed(self, idx: int):
         cam_index = self.cam_combo.currentData()
         print(f"[Cam] Cambio de selección: {cam_index}")
+        self._stop_preview()
         if cam_index is None or int(cam_index) == -1:
             self.drop.reset_placeholder()
+        else:
+            self._start_preview(int(cam_index))
+
+    def _start_preview(self, index: int):
+        self._cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+        if not self._cap.isOpened():
+            QMessageBox.critical(self, "Cámara", "No se pudo abrir la cámara seleccionada.")
+            self._cap = None
+            return
+        self._cam_timer.start()
+
+    def _stop_preview(self):
+        self._cam_timer.stop()
+        if self._cap:
+            try:
+                self._cap.release()
+            except Exception:
+                pass
+            self._cap = None
+
+    def _apply_rot_crop(self, frame):
+        if self._rot == 90:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        elif self._rot == 180:
+            frame = cv2.rotate(frame, cv2.ROTATE_180)
+        elif self._rot == 270:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+        if self.chk_autocrop.isChecked() and self.drop.width() > 0 and self.drop.height() > 0:
+            h, w = frame.shape[:2]
+            target_aspect = self.drop.width() / max(1, self.drop.height())
+            frame_aspect = w / max(1, h)
+            if abs(frame_aspect - target_aspect) > 1e-3:
+                if frame_aspect > target_aspect:
+                    new_w = int(h * target_aspect)
+                    x0 = max(0, (w - new_w) // 2)
+                    frame = frame[:, x0:x0 + new_w]
+                else:
+                    new_h = int(w / target_aspect)
+                    y0 = max(0, (h - new_h) // 2)
+                    frame = frame[y0:y0 + new_h, :]
+        return frame
+
+    def _render_preview(self, frame):
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
+        self.drop.show_qimage(qimg)
+
+    def _update_preview(self):
+        if not self._cap:
+            return
+        ret, frame = self._cap.read()
+        if not ret:
+            return
+        self._last_frame = frame
+        frame = self._apply_rot_crop(self._last_frame.copy())
+        self._render_preview(frame)
+
+    def _set_rot(self, delta: int):
+        self._rot = (self._rot + delta) % 360
+        if self._last_frame is not None:
+            frame = self._apply_rot_crop(self._last_frame.copy())
+            self._render_preview(frame)
 
     def _capture_frame(self):
         cam_index = self.cam_combo.currentData()
         if cam_index is None or cam_index == -1:
             QMessageBox.warning(self, "Cámara", "Selecciona una cámara distinta de 'Ninguna'.")
             return
-        cap = cv2.VideoCapture(int(cam_index), cv2.CAP_DSHOW)
-        if not cap.isOpened():
-            QMessageBox.critical(self, "Cámara", "No se pudo abrir la cámara seleccionada.")
-            return
-        ret, frame = cap.read()
-        cap.release()
-        if not ret:
-            QMessageBox.critical(self, "Cámara", "No se pudo capturar imagen.")
+        if self._last_frame is None:
+            QMessageBox.warning(self, "Cámara", "Aún no hay imagen de la cámara.")
             return
         tmp = resource_path("_captura_tmp.png")
+        frame = self._apply_rot_crop(self._last_frame.copy())
         cv2.imwrite(tmp, frame)
         self.drop.load_path(tmp)
-        try: os.remove(tmp)
-        except Exception: pass
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
 
     # IA
     def _img_and_mime_or_none(self):
@@ -791,22 +1737,16 @@ class OptionBPage(QWidget):
 
     def _maybe_autogenerate(self, trigger: str):
         api_key = self.main.settings.value("accounts/google_api_key", "", str)
-        company = self.main.settings.value("accounts/company_name", "", str)
         print(f"[IA-Presupuestos] Trigger: {trigger} · API {'sí' if api_key else 'no'}")
         if not api_key:
             return
 
-        # Si sólo cambia el nombre del destinatario y ya hay HTML, reemplaza inline
-        if trigger.startswith("name") and self._last_html:
+        if trigger.startswith("name") and (self._body_raw or self.body_edit.toPlainText().strip()):
             name_now = self.to_edit.text().strip()
-            html = self._last_html
             if name_now:
-                html = html.replace("[Nombre del destinatario]", name_now)
-            if company:
-                html = html.replace("[Tu Nombre]", company)
-            self._last_html = html
-            self.body_edit.blockSignals(True); self.body_edit.setHtml(html); self.body_edit.blockSignals(False)
-            return
+                self._body_raw = (self._body_raw or self.body_edit.toPlainText()).replace("[Nombre del destinatario]", name_now)
+                self._render_body_from_raw()
+                return
 
         img, mime = self._img_and_mime_or_none()
         if not img:
@@ -815,41 +1755,102 @@ class OptionBPage(QWidget):
 
         name_now = self.to_edit.text().strip()
         self.subject_edit.setPlaceholderText("Generando asunto con IA…")
-        self.body_edit.setPlaceholderText("Generando cuerpo (HTML) con IA…")
-        self.btn_pdf.setEnabled(False); self.btn_send.setEnabled(False)
+        self.body_edit.setPlaceholderText("Generando cuerpo con IA…")
+        self.btn_pdf.setEnabled(False); self.btn_send.setEnabled(False); self.btn_print.setEnabled(False)
 
-        self._ai_worker = EmailGenWorker(api_key, name_now, company, img, mime)
+        self._ai_worker = EmailGenWorker(api_key, name_now, img, mime)
         self._ai_worker.finished.connect(self._on_ai_ready)
         self._ai_worker.failed.connect(self._on_ai_failed)
         self._ai_worker.start()
         print("[IA-Presupuestos] Worker iniciado.")
 
-    def _on_ai_ready(self, subject: str, body_html: str, body_text: str):
+    def _apply_owner_name(self, text: str) -> str:
+        owner = self.main.settings.value("accounts/owner_name", "", str).strip()
+        if not owner:
+            return text
+        placeholders = (
+            "[Tu Nombre]", "[Tu nombre]", "[Tu Nombre/Empresa]", "[Nombre/Empresa]",
+            "[Nombre de Empresa]", "[Nombre de empresa]", "[nombre de empresa]",
+            "[Empresa]", "[empresa]", "[Mi Empresa]", "[mi empresa]"
+        )
+        for ph in placeholders:
+            text = text.replace(ph, owner)
+        return text
+
+    def update_owner_name(self, owner: str):
+        owner = (owner or "").strip()
+        if not owner:
+            return
+        placeholders = (
+            "[Tu Nombre]", "[Tu nombre]", "[Tu Nombre/Empresa]", "[Nombre/Empresa]",
+            "[Nombre de Empresa]", "[Nombre de empresa]", "[nombre de empresa]",
+            "[Empresa]", "[empresa]", "[Mi Empresa]", "[mi empresa]"
+        )
+        changed = False
+        if self._body_raw:
+            new_raw = self._body_raw
+            for ph in placeholders:
+                new_raw = new_raw.replace(ph, owner)
+            if new_raw != self._body_raw:
+                self._body_raw = new_raw
+                changed = True
+        else:
+            current = self.body_edit.toPlainText()
+            new = current
+            for ph in placeholders:
+                new = new.replace(ph, owner)
+            if new != current:
+                self._body_raw = new
+                changed = True
+        if changed:
+            self._render_body_from_raw()
+
+    def _render_body_from_raw(self):
+        raw = (self._body_raw or "").strip()
+        html_div = self._body_text_to_html(raw)
+        self.body_edit.blockSignals(True)
+        self.body_edit.setHtml(html_div)
+        self.body_edit.blockSignals(False)
+
+    def _on_ai_ready(self, subject: str, body: str):
         print("[IA-Presupuestos] Resultado recibido.")
-        self._last_html, self._last_text = body_html, body_text
-        self.subject_edit.blockSignals(True); self.body_edit.blockSignals(True)
+        self.subject_edit.blockSignals(True)
         if not self.subject_edit.text().strip():
             self.subject_edit.setText(subject)
-        self.body_edit.setHtml(body_html)
-        self.subject_edit.blockSignals(False); self.body_edit.blockSignals(False)
-        self.btn_pdf.setEnabled(True); self.btn_send.setEnabled(True)
+        name_now = self.to_edit.text().strip()
+        if name_now:
+            body = body.replace("[Nombre del destinatario]", name_now)
+        self._body_raw = self._apply_owner_name(body)
+        self.subject_edit.blockSignals(False)
+
+        self._render_body_from_raw()
+
+        self.btn_pdf.setEnabled(True); self.btn_send.setEnabled(True); self.btn_print.setEnabled(True)
 
     def _on_ai_failed(self, msg: str):
         print("[IA-Presupuestos] Error:", msg)
-        self.btn_pdf.setEnabled(True); self.btn_send.setEnabled(True)
+        self.btn_pdf.setEnabled(True); self.btn_send.setEnabled(True); self.btn_print.setEnabled(True)
 
-    # Helpers de cuerpo actual
-    def _current_body_html_text(self) -> Tuple[str, str]:
-        html = self._last_html or self.body_edit.toHtml()
-        txt = self._last_text or re.sub("<[^<]+?>", "", html).replace("&nbsp;"," ").replace("&amp;","&")
-        # Asegura firma con nombre/empresa de configuración
-        company = self.main.settings.value("accounts/company_name", "", str)
-        if company:
-            html = html.replace("[Tu Nombre]", company)
-            txt = txt.replace("[Tu Nombre]", company)
-        return html, txt
+    def _body_text_to_html(self, body_text: str) -> str:
+        rendered = markdown_table_to_html(body_text)
+        if rendered is None:
+            safe = html_escape(body_text)
+            safe = "".join(
+                f"<p style='margin:0 0 10px'>{line}</p>" if line.strip()
+                else "<p style='margin:0 0 12px'>&nbsp;</p>"
+                for line in safe.split("\n")
+            )
+            content = safe
+        else:
+            content = rendered
 
-    # PDF y correo
+        return (
+            "<div style='font-family:Arial,Helvetica,sans-serif;"
+            "font-size:12pt;color:#222;line-height:1.6'>"
+            f"{content}"
+            "</div>"
+        )
+
     def export_pdf(self):
         default_dir = self.main.settings.value("paths/pdf_dir", os.getcwd(), str) or os.getcwd()
         default_path = os.path.join(default_dir, "presupuesto.pdf")
@@ -859,29 +1860,48 @@ class OptionBPage(QWidget):
         if not path.lower().endswith(".pdf"):
             path += ".pdf"
         try:
+            subj = (self.subject_edit.text().strip() or "Solicitud de cotización")
+            html = self._compose_html_document(subj, self._body_raw or self.body_edit.toPlainText())
+
             printer = QPrinter(QPrinter.PrinterMode.HighResolution)
             printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
             printer.setOutputFileName(path)
-            printer.setPageMargins(QMarginsF(12, 12, 12, 12))
+            printer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
+            printer.setPageMargins(QMarginsF(15, 15, 15, 15), QPageLayout.Unit.Millimeter)
 
-            subj = (self.subject_edit.text().strip() or "Presupuesto")
-            body_html, _ = self._current_body_html_text()
-
-            html = f"""
-            <html><head><meta charset='utf-8'>
-            <style>body{{font-family:Arial; font-size:11pt}} h2{{margin:0 0 12px 0}} table{{font-size:10pt}}</style>
-            </head><body>
-            <h2>{html_escape(subj)}</h2>
-            <hr>
-            <div>{body_html}</div>
-            </body></html>
-            """
             doc = QTextDocument()
             doc.setHtml(html)
             doc.print(printer)
             print(f"[PDF] Guardado en: {path}")
         except Exception as e:
             QMessageBox.critical(self, "PDF", f"No se pudo generar el PDF:\n{human_ex(e)}")
+
+    def print_document(self):
+        try:
+            printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+            printer.setPageMargins(QMarginsF(52, 52, 52, 52))
+            subj = (self.subject_edit.text().strip() or "Solicitud de cotización")
+            body_text = self._apply_owner_name(self.body_edit.toPlainText().strip())
+            body_html = self._body_text_to_html(body_text)
+            html = f"""
+            <html><head><meta charset='utf-8'>
+            <style>
+                body{{font-family:Arial,Helvetica,sans-serif; font-size:12pt; color:#222; line-height:1.6}}
+                h2{{margin:0 0 8px}}
+                hr{{border:none; border-top:1px solid #ddd; margin:0 0 14px}}
+            </style>
+            </head><body>
+            <h2>{html_escape(subj)}</h2>
+            <hr>
+            {body_html}
+            </body></html>
+            """
+            doc = QTextDocument()
+            doc.setHtml(html)
+            doc.print(printer)
+            QMessageBox.information(self, "Imprimir", "Documento enviado a la impresora predeterminada.")
+        except Exception as e:
+            QMessageBox.critical(self, "Imprimir", f"No se pudo imprimir:\n{human_ex(e)}")
 
     def send_email(self):
         server = self.main.settings.value("accounts/smtp_server", "smtp.gmail.com", str)
@@ -890,7 +1910,7 @@ class OptionBPage(QWidget):
         password = self.main.settings.value("accounts/smtp_password", "", str)
         to_addr = self.mail_edit.text().strip()
         subject = self.subject_edit.text().strip()
-        body_html, body_text = self._current_body_html_text()
+        body_text = self._apply_owner_name((self._body_raw or self.body_edit.toPlainText()).strip())
 
         if not (server and port and user and password and to_addr and subject and body_text):
             QMessageBox.warning(self, "Correo", "Completa credenciales SMTP en Configuración y los campos del correo.")
@@ -902,9 +1922,10 @@ class OptionBPage(QWidget):
             msg["From"] = user
             msg["To"] = to_addr
             msg["Subject"] = subject
-            # Parte texto y parte HTML
+
             msg.set_content(body_text)
-            msg.add_alternative(body_html, subtype="html")
+            html_body = self._body_text_to_html(body_text)
+            msg.add_alternative(f"""<html><body>{html_body}</body></html>""", subtype="html")
 
             print(f"[SMTP] Conectando a {server}:{port} como {user}…")
             if port == 465:
@@ -927,88 +1948,73 @@ class OptionBPage(QWidget):
             print("[SMTP][ERROR]", human_ex(e))
             QMessageBox.critical(self, "Correo", f"No se pudo enviar el correo:\n{human_ex(e)}")
 
+    def stop_camera(self):
+        self._stop_preview()
+
 # ------------------- Configuración -------------------
 
-def format_bytes_gb(n: int) -> str:
-    try:
-        return f"{round(n/1024/1024/1024)} GB"
-    except Exception:
-        return "N/D"
+def _bytes_to_gb(b: int) -> int:
+    return int(round(b / (1024**3)))
 
 def get_system_info() -> str:
-    # CPU
-    cpu = platform.processor() or os.environ.get("PROCESSOR_IDENTIFIER", "").strip() or "N/D"
-    # RAM
-    ram_total = "N/D"
+    cpu = platform.processor() or "Desconocido"
+    ram_txt = "Desconocida"
     if psutil:
         try:
-            ram_total = format_bytes_gb(psutil.virtual_memory().total)
+            ram_txt = f"Capacidad Total: {_bytes_to_gb(psutil.virtual_memory().total)} GB"
         except Exception:
             pass
-    # GPUs
+
     gpus = []
     try:
-        # Windows: wmic
-        out = subprocess.check_output(["wmic","path","win32_VideoController","get","Name,AdapterRAM"], stderr=subprocess.DEVNULL).decode(errors="ignore").splitlines()
-        for ln in out[1:]:
-            ln = " ".join(ln.split()).strip()
-            if not ln: continue
-            if "AdapterRAM" in ln: continue
-            # Línea viene como: "NVIDIA GeForce RTX 3070 Laptop GPU  8589934592"
-            parts = ln.rsplit(" ", 1)
-            name = parts[0].strip()
-            mem = ""
-            if len(parts) == 2 and parts[1].isdigit():
-                mem = format_bytes_gb(int(parts[1]))
-            gpus.append(f"{name}{f' ({mem})' if mem else ''}")
+        if sys.platform.startswith("win"):
+            out = subprocess.run(
+                ["wmic", "path", "win32_VideoController", "get", "Name"],
+                capture_output=True, text=True
+            ).stdout
+            for line in out.splitlines():
+                line = line.strip()
+                if line and line.upper() != "NAME":
+                    gpus.append(line)
     except Exception:
         pass
     if not gpus:
-        gpus = ["No detectado"]
+        gpus.append("No detectado")
 
-    # CUDA
-    cuda_line = "No se detectó una GPU NVIDIA."
+    cuda_lines = ["No se detectó una GPU NVIDIA..."]
     try:
-        out = subprocess.check_output(["nvidia-smi","--query-gpu=cuda_version","--format=csv,noheader"], stderr=subprocess.DEVNULL, timeout=2).decode().strip()
-        if out:
-            cuda_line = f"Versión de CUDA instalada: {out}"
+        nsmi = subprocess.run(["nvidia-smi", "--query-gpu=cuda_version", "--format=csv,noheader"],
+                              capture_output=True, text=True)
+        if nsmi.returncode == 0 and nsmi.stdout.strip():
+            ver = nsmi.stdout.strip().splitlines()[0].trim() if hasattr(str, "trim") else nsmi.stdout.strip().splitlines()[0].strip()
+            cuda_lines = [ "Se detectó una GPU NVIDIA...", f"Versión de CUDA instalada: {ver}" ]
     except Exception:
-        # Fallback con torch
-        try:
-            import torch
-            if torch.cuda.is_available():
-                cuda_line = f"Versión de CUDA (PyTorch): {getattr(torch.version,'cuda', 'desconocida')}"
-        except Exception:
-            pass
+        pass
 
-    # Formato estilo tu ejemplo
-    lines = []
-    lines.append("[PROCESADOR]")
-    lines.append(cpu)
-    lines.append("")
-    lines.append("[MEMORIA RAM]")
-    lines.append(f"Capacidad Total: {ram_total}")
-    lines.append("")
-    lines.append("[TARJETA GRÁFICA (GPU)]")
-    for g in gpus:
-        lines.append(g)
-    lines.append("")
-    lines.append("[VERSIÓN DE CUDA]")
-    if "NVIDIA" in " ".join(gpus):
-        lines.append("Se detectó una GPU NVIDIA...")
-    lines.append(cuda_line)
+    block = []
+    block.append("[PROCESADOR]")
+    block.append(cpu)
+    block.append("")
+    block.append("[MEMORIA RAM]")
+    block.append(ram_txt)
+    block.append("")
+    block.append("[TARJETA GRÁFICA (GPU)]")
+    block.extend(gpus)
+    block.append("")
+    block.append("[VERSIÓN DE CUDA]")
+    block.extend(cuda_lines)
 
-    return "\n".join(lines)
+    return "\n".join(block)
 
 class SettingsDialog(QDialog):
     def __init__(self, parent_main):
         super().__init__(parent_main)
         self.main = parent_main
         self.setWindowTitle("Configuración")
-        self.setMinimumSize(780, 620)
+        self.setMinimumSize(780, 600)
         lay = QVBoxLayout(self)
 
-        # Topbar (solo back y título)
+        # Topbar
         top = QHBoxLayout()
         back = QPushButton("←"); back.setFixedSize(36, 28); back.clicked.connect(self.accept)
         title = QLabel("Configuración")
@@ -1019,22 +2025,34 @@ class SettingsDialog(QDialog):
         self.tabs = QTabWidget()
         lay.addWidget(self.tabs, 1)
 
-        self._tab_general()       # incluye sistema / versión / update + rutas
-        self._tab_accounts_api()  # cuentas, API y nombre/empresa
+        self._tab_general()
+        self._tab_accounts_api()
 
-        # Lanzar validaciones automáticas
         QTimer.singleShot(400, self._auto_validate_all)
 
     def _tab_general(self):
         w = QWidget(); l = QVBoxLayout(w)
 
-        # ---- Ruta TGP (carpeta)
+        # ---- Ruta TGP (EXE/LNK)
         grp1 = QGroupBox("Ruta actual de TGP (exe/lnk)")
         g1 = QVBoxLayout(grp1)
-        self.ed_prog = QLineEdit(self.main.settings.value("paths/program_path", os.getcwd(), str))
+        current_tgp = self.main.settings.value("paths/tgp_path", "", str)
+        self.ed_prog = QLineEdit(current_tgp)
         self.ed_prog.setReadOnly(True)
-        b1 = QPushButton("Elegir carpeta de destino")
-        b1.clicked.connect(self._choose_prog_dir)
+        b1 = QPushButton("Cambiar…")
+
+        def choose_prog():
+            start_dir = os.path.dirname(self.ed_prog.text()) if self.ed_prog.text() else os.getcwd()
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Selecciona ejecutable o acceso directo de TGP",
+                start_dir,
+                "Ejecutables y accesos directos (*.exe *.lnk);;Todos los archivos (*.*)"
+            )
+            if path:
+                self.ed_prog.setText(path)
+                self.main.settings.setValue("paths/tgp_path", path)
+
+        b1.clicked.connect(choose_prog)
         g1.addWidget(self.ed_prog); g1.addWidget(b1)
 
         # ---- Carpeta PDF
@@ -1043,65 +2061,54 @@ class SettingsDialog(QDialog):
         self.ed_pdf = QLineEdit(self.main.settings.value("paths/pdf_dir", os.getcwd(), str))
         self.ed_pdf.setReadOnly(True)
         b2 = QPushButton("Elegir carpeta de destino")
-        b2.clicked.connect(self._choose_pdf_dir)
+        def choose_pdf_dir():
+            d = QFileDialog.getExistingDirectory(self, "Selecciona carpeta PDF", self.ed_pdf.text() or os.getcwd())
+            if d:
+                self.ed_pdf.setText(d)
+                self.main.settings.setValue("paths/pdf_dir", d)
+        b2.clicked.connect(choose_pdf_dir)
         g2.addWidget(self.ed_pdf); g2.addWidget(b2)
 
         # ---- Sistema / Versión
         grp_sys = QGroupBox("Características:")
         gl = QVBoxLayout(grp_sys)
         self.lbl_specs = QLabel(get_system_info())
-        self.lbl_specs.setStyleSheet("font-family:Consolas, monospace; background:#f6f7fb; border:1px solid #e1e3ea; border-radius:8px; padding:8px;")
+        self.lbl_specs.setStyleSheet(
+            "font-family:Consolas, monospace; background:#f6f7fb; "
+            "border:1px solid #e1e3ea; border-radius:8px; padding:10px;"
+        )
         self.lbl_specs.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         gl.addWidget(self.lbl_specs)
 
-        # Versión + botón update grande
-        hl = QVBoxLayout()
+        ver_row = QVBoxLayout()
         self.lbl_version = QLabel(f"Versión: v{APP_VERSION}")
         self.btn_update = QPushButton("Comprobando actualizaciones…")
         self.btn_update.setEnabled(False)
-        self.btn_update.setMinimumHeight(28)
-        self.btn_update.setStyleSheet("""
-            QPushButton {
-                background:#e9edf7; border:1px solid #c9d3ee; color:#4f6fb5;
-                font-weight:600; border-radius:6px; padding:8px;
-            }
-            QPushButton:disabled { color:#8ea0c5; }
-        """)
+        self.btn_update.setMinimumHeight(36)
+        self.btn_update.setStyleSheet(
+            "QPushButton{background:#eee; border:1px solid #d6d9e0; border-radius:6px}"
+            "QPushButton:disabled{color:#999;}"
+        )
         self.btn_update.clicked.connect(self._start_update)
-        hl.addWidget(self.lbl_version)
-        hl.addWidget(self.btn_update)
+        ver_row.addWidget(self.lbl_version)
+        ver_row.addWidget(self.btn_update)
 
-        l.addWidget(grp1); l.addWidget(grp2); l.addWidget(grp_sys); l.addLayout(hl); l.addStretch(1)
+        l.addWidget(grp1); l.addWidget(grp2); l.addWidget(grp_sys); l.addLayout(ver_row); l.addStretch(1)
         self.tabs.addTab(w, "General")
 
-        # Verificación de updates
         self._update_info = None
         self._upd = UpdateCheckerWorker()
         self._upd.finished.connect(self._on_update_check)
         self._upd.start()
 
-    def _choose_prog_dir(self):
-        d = QFileDialog.getExistingDirectory(self, "Selecciona carpeta de TGP", self.ed_prog.text() or os.getcwd())
-        if d:
-            self.ed_prog.setText(d)
-            self.main.settings.setValue("paths/program_path", d)
-
-    def _choose_pdf_dir(self):
-        d = QFileDialog.getExistingDirectory(self, "Selecciona carpeta PDF", self.ed_pdf.text() or os.getcwd())
-        if d:
-            self.ed_pdf.setText(d)
-            self.main.settings.setValue("paths/pdf_dir", d)
-
     def _tab_accounts_api(self):
         w = QWidget(); l = QVBoxLayout(w)
 
-        # Nombre/Empresa
-        grp_me = QGroupBox("Identidad (Remitente)")
-        fme = QFormLayout(grp_me)
-        self.ed_company = QLineEdit(self.main.settings.value("accounts/company_name", "", str))
-        fme.addRow("Nombre / Empresa:", self.ed_company)
+        grp_owner = QGroupBox("Identidad (firma)")
+        fo = QFormLayout(grp_owner)
+        self.ed_owner = QLineEdit(self.main.settings.value("accounts/owner_name", "", str))
+        fo.addRow("Nombre o Empresa:", self.ed_owner)
 
-        # Google API
         grp_g = QGroupBox("Google API (Gemini)")
         fg = QFormLayout(grp_g)
         self.ed_api = QLineEdit(self.main.settings.value("accounts/google_api_key", "", str))
@@ -1110,7 +2117,6 @@ class SettingsDialog(QDialog):
         fg.addRow("API Key:", self.ed_api)
         fg.addRow("Estado:", self.lbl_api_state)
 
-        # SMTP
         grp_s = QGroupBox("Correo saliente (SMTP)")
         fs = QFormLayout(grp_s)
         self.ed_smtp_server = QLineEdit(self.main.settings.value("accounts/smtp_server", "smtp.gmail.com", str))
@@ -1126,13 +2132,25 @@ class SettingsDialog(QDialog):
         fs.addRow("Contraseña:", self.ed_smtp_pass)
         fs.addRow("Estado:", self.lbl_smtp_state)
 
-        l.addWidget(grp_me)
+        l.addWidget(grp_owner)
         l.addWidget(grp_g)
         l.addWidget(grp_s)
         l.addStretch(1)
         self.tabs.addTab(w, "Cuentas / API")
 
         # Timers automáticos
+        def _commit_owner():
+            name = self.ed_owner.text().strip()
+            self.main.settings.setValue("accounts/owner_name", name)
+            try:
+                self.main.page_b.update_owner_name(name)
+            except Exception:
+                pass
+
+        self._t_owner = QTimer(self); self._t_owner.setSingleShot(True)
+        self._t_owner.timeout.connect(_commit_owner)
+        self.ed_owner.textChanged.connect(lambda _=None: self._t_owner.start(400))
+
         self._t_api = QTimer(self); self._t_api.setSingleShot(True)
         self._t_api.timeout.connect(self._validate_api_auto)
         self.ed_api.textChanged.connect(lambda _=None: self._t_api.start(700))
@@ -1141,9 +2159,6 @@ class SettingsDialog(QDialog):
         self._t_smtp.timeout.connect(self._validate_smtp_auto)
         for wdg in (self.ed_smtp_server, self.ed_smtp_port, self.ed_smtp_email, self.ed_smtp_pass):
             wdg.textChanged.connect(lambda _=None: self._t_smtp.start(800))
-
-        # Guardar nombre/empresa al vuelo
-        self.ed_company.textChanged.connect(lambda: self.main.settings.setValue("accounts/company_name", self.ed_company.text().strip()))
 
     # Auto-validaciones
     def _auto_validate_all(self):
@@ -1217,7 +2232,7 @@ class SettingsDialog(QDialog):
         tag = (info.get("tag") or "").lstrip("v")
         newer = tag and (tag != APP_VERSION)
         if newer:
-            self.btn_update.setText(f"Estás en la última versión" if not newer else f"Actualizar a v{tag}")
+            self.btn_update.setText(f"Actualizar a v{tag}")
             self.btn_update.setEnabled(True)
         else:
             self.btn_update.setText("Estás en la última versión")
@@ -1271,9 +2286,8 @@ class HomePage(QWidget):
         super().__init__()
         lay = QVBoxLayout(self)
 
-        # Barra superior: título centrado + engranaje
         top = QHBoxLayout()
-        top.addSpacing(36)  # simetría con engranaje
+        top.addSpacing(36)
         title = QLabel("BALADA PACKAGING .S.L.U.")
         f = QFont(); f.setPointSize(18); f.setBold(True); title.setFont(f)
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1283,7 +2297,6 @@ class HomePage(QWidget):
         top.addWidget(gear)
         lay.addLayout(top)
 
-        # Dos imágenes (botones)
         imgs = QHBoxLayout()
         self.img_a = ClickLabel(); self._load_img(self.img_a, "multimedia/Opcion_A.png")
         self.img_b = ClickLabel(); self._load_img(self.img_b, "multimedia/Opcion_B.png")
@@ -1295,10 +2308,9 @@ class HomePage(QWidget):
         imgs.addWidget(self.img_b, 1)
         lay.addLayout(imgs, 1)
 
-        # Etiquetas
         foot = QHBoxLayout()
-        la = QLabel("Imagen A"); la.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lb = QLabel("Imagen B"); lb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        la = QLabel("TG Profesional: Ingresar datos al sistema"); la.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lb = QLabel("Solicitud de cotizacion a proveedores"); lb.setAlignment(Qt.AlignmentFlag.AlignCenter)
         foot.addWidget(la, 1); foot.addWidget(lb, 1)
         lay.addLayout(foot)
 
@@ -1325,11 +2337,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("BALADA PACKAGING · Presupuestos")
         self.setMinimumSize(1100, 720)
 
-        # Stacked central
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
 
-        # Páginas
         self.page_home = HomePage()
         self.page_a = OptionAPage(self)
         self.page_b = OptionBPage(self)
@@ -1343,9 +2353,6 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.page_b)
         self.stack.setCurrentWidget(self.page_home)
 
-        # Sin botón “Configuración” duplicado (sólo engranaje).
-
-        # Console update info
         self._console_update_check()
 
     def go_home(self):
@@ -1365,6 +2372,17 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 print("[UPDATE] No se pudo comprobar:", human_ex(e))
         QTimer.singleShot(1000, _bg)
+
+    def closeEvent(self, e):
+        try:
+            self.page_b.stop_camera()
+        except Exception:
+            pass
+        try:
+            self.page_a.stop_camera()
+        except Exception:
+            pass
+        super().closeEvent(e)
 
 # ------------------- main() --------------------------
 
