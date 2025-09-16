@@ -34,7 +34,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QFileDialog, QStackedWidget, QLineEdit, QTextEdit,
     QComboBox, QMessageBox, QGroupBox, QFormLayout, QTabWidget, QDialog,
     QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView, QStyledItemDelegate,
-    QTextBrowser
+    QTextBrowser, QSizePolicy
 )
 from PyQt6.QtPrintSupport import QPrinter, QPrintDialog, QPrinterInfo
 
@@ -2386,17 +2386,22 @@ class HomePage(QWidget):
         lay.addLayout(foot)
 
     def _load_img(self, label: QLabel, relpath: str):
+        # El contenedor debe centrar la imagen sin escalarla
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setScaledContents(False)  # ¡No escalar!
+        label.setMinimumSize(520, 360)  # área visible mínima
+        label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        label.setStyleSheet("border:1px solid #d6d6d6; border-radius:12px; background:#f5f5f5;")
+
         p = resource_path(relpath)
         if os.path.exists(p):
-            pm = QPixmap(p)
-            label.setPixmap(pm.scaled(QSize(520, 360), Qt.AspectRatioMode.KeepAspectRatio,
-                                      Qt.TransformationMode.SmoothTransformation))
-            label.setStyleSheet("border:1px solid #d6d6d6; border-radius:12px;")
+            pm = QPixmap(p)            # mantener tamaño original del archivo
+            label.setPixmap(pm)        # se centra gracias a setAlignment(...)
         else:
             label.setText("Imagen no encontrada")
-            label.setStyleSheet("color:#9aa0a6; border:1px dashed #d6d6d6; border-radius:12px;")
-            label.setMinimumSize(520, 360)
+            label.setStyleSheet("color:#9aa0a6; border:1px dashed #d6d6d6; border-radius:12px; background:#fafafa;")
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
 
 # ------------------- MainWindow ----------------------
 
